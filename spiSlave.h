@@ -1,6 +1,7 @@
 #ifndef __SPI_SLAVE_H
 #define __SPI_SLAVE_H
-
+/* building define  */
+#define DEBUG
 /* Hardware resources */
 
 /* ECSPI-1/2 */
@@ -62,11 +63,18 @@ typedef struct _spi_slave_device{
   u8 *name;
   /* initialization status */
   u8 initStatus;
+#ifdef DEBUG
+  /* proc parent for registers interface */
+  struct proc_dir_entry *proc_dir;
+#endif
 }spi_slave_device;
 extern spi_slave_device spi_devices[];
 
-
 /*  function devlarations */
+int delete_spi_regs (spi_slave_device *dev ,char *names[]);
+int create_spi_regs (spi_slave_device *dev, char *names[]);
 
+struct proc_dir_entry * register_proc (const char* name,read_proc_t *read_proc,write_proc_t *write_proc,struct proc_dir_entry *parent,void *data );
+void unregister_proc(const char* name,struct proc_dir_entry *parent);
 void deinit_device (spi_slave_device *dev);
 #endif
