@@ -2,6 +2,21 @@
 # MUST HAVE a UNIQUE name , there shall not be 
 # a source with the same name, in that case the 
 # source will not be included in the build !!!
+
+# Git instructions
+# to create a local repository: git init 
+# to decide which file not to track create a file named .gitignore 
+# to add file to the local repos : git add <path2theFile>
+# to set username and name :
+#	git config --global user.name "Your Name"
+#	git config --global user.email you@example.com
+# to make the first commit :
+# 	git commit -m "Initial spiSlaveDrv commit"
+#
+# to add a remote repos:
+# git remote add origin git@github.com:zad80/spiSlaveDrv.git
+# to push commits to the remote:
+# git push -u origin master
 DRIVERNAME:=spiSlaveDrv
 ifeq ($(KERNEL_DIR),)
 KERNEL_DIR:= /usr/src/linux
