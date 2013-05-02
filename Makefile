@@ -27,7 +27,7 @@ endif
 endif
 
 PWD:=$(shell pwd)
-dirs := $(shell find $(PWD) -type d| grep -v "$(KERNEL_DIR)"  | grep -v shell)
+dirs := $(shell find $(PWD) -type d| grep -v "$(KERNEL_DIR)"  | grep -v shell | grep -v .git)
 srcs := $(shell find $(PWD) -name "*.c" |  grep -v "$(KERNEL_DIR)"|  grep -v shell )
 INCL += $(foreach d,$(dirs),$(addprefix -I,$d))
 OBJSt = $(foreach c,$(srcs),$(subst .c,.o,$c))
@@ -38,7 +38,9 @@ OBJS := $(foreach c,$(OBJSt),$(subst $(PWD)/, ,$c))
 MAKEFLAGS +=e
 export OBJS
 export INCL
+INCL += -I$(KERNEL_DIR)/arch/arm/mach-mx5/devices/
 MODFLAGS += $(INCL)
+
 ifeq ($(KERNELVERSION),)
 # we aren't inside the kbuild system so
 # go inside it
