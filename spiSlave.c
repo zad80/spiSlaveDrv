@@ -51,6 +51,25 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Zad");
 
+//if raw is defined, resources aren't requested to access iomem but
+//instead phisical addresses are used.
+//#define RAW
+
+#ifdef RAW
+#undef writeb 
+#undef writew
+#undef writel
+#undef readb
+#undef readw
+#undef readl
+#define writeb __raw_writeb
+#define writew __raw_writew
+#define writel __raw_writel
+#define readb __raw_readb
+#define readw __raw_readw
+#define readl __raw_readl
+#endif
+#define gpio_nr(bank, nr)       ((bank - 1) * 32 + nr)
 
 static struct pad_desc spi1_pads[] = {
         MX53_PAD_SD2_CLK__CSPI2_SCLK,
@@ -78,6 +97,7 @@ static struct pad_desc spi2_pads[] = {
 ring_buffer_t* readWrite_buffer=NULL;
 
 spi_slave_device spi_devices[]={
+#if 0
   {
     .regs_addr=ECSPI1_BASE,
     .base=NULL,
@@ -91,7 +111,9 @@ spi_slave_device spi_devices[]={
     .mode=SPI_CPOL,
     .bits_per_word = 16,
     .detect_onCS=0,
+    .gpio_cs=gpio_nr(1, 12),
   },
+#endif
   {
     .regs_addr=ECSPI2_BASE,
     .base=NULL,
@@ -105,6 +127,7 @@ spi_slave_device spi_devices[]={
     .mode=SPI_CPOL,
     .bits_per_word = 16,
     .detect_onCS=0,
+    .gpio_cs=gpio_nr(5, 29),
   },
 #if 0
   {
@@ -120,6 +143,7 @@ spi_slave_device spi_devices[]={
     .mode=SPI_CPOL,
     .bits_per_word = 16,
     .detect_onCS=0,
+    .gpio_cs=-1,
   },
 #endif
 };
@@ -132,12 +156,13 @@ bool opened=false;
 /* mmapping global variable */
 // pointer to the vmalloc'd area - alway page aligned
 static char *vmalloc_area;
-unsigned int readerIndex=4;
+unsigned int *readerIndex=NULL;
 unsigned int *writerIndex=NULL;
 struct fasync_struct *async_queue;
 bool run_timer=false;
 unsigned char fake_count=0;
 struct timer_list fake_timer;
+#define TIMERDELAY 3
 /* function declaration */
 void add_fake_data(unsigned long arg);
 int addToBuffer(char newValue);
@@ -169,6 +194,20 @@ static void __exit exit_dd(void);
 int write_proc(struct file *file, const char __user *buffer, unsigned long count, void *data);
 
 
+void set_chipSelect(spi_slave_device *dev){
+  if(dev==NULL)
+    return;
+  if(dev->master)
+  {
+    gpio_direction_output(dev->gpio_cs, dev->mode & SPI_CS_HIGH ? 0 : 1);
+    gpio_set_value(dev->gpio_cs, !(dev->mode & SPI_CS_HIGH));
+    debugPrintFL(50,DRIVER,"direction: %x,value: %x\n",dev->mode & SPI_CS_HIGH ? 0 : 1,!(dev->mode & SPI_CS_HIGH));
+  }else{
+    gpio_direction_input(dev->gpio_cs);
+    debugPrintFL(50,DRIVER,"direction slave:INPUT" );
+
+  }
+}
 
 
 /* Function implementation for char device */
@@ -254,7 +293,7 @@ int spi_ioctl(struct inode *inode,struct file *filp,unsigned int cmd,unsigned lo
             fake_timer.data=(unsigned long)&fake_count;
             fake_timer.function=add_fake_data;
             /* 1 Second in the future */
-            fake_timer.expires=jiffies + HZ;
+            fake_timer.expires=jiffies + TIMERDELAY;
             debugPrintF(DRIVER,"call add_timer\n");
             add_timer(&fake_timer);
             debugPrintF(DRIVER,"add_timer called\n");
@@ -272,28 +311,23 @@ int spi_ioctl(struct inode *inode,struct file *filp,unsigned int cmd,unsigned lo
     case C_SPISLAVE_IOSETREADEP:
       {
         YSPISLAVE_SETREADERP  data;
-        data.res=0;
         debugPrintF(DRIVER,"doing C_SPISLAVE_IOSETREADEP IOCTL.\n");
         if ((err = copy_from_user(&data, (YSPISLAVE_SETREADERP *)arg, sizeof(YSPISLAVE_SETREADERP))) < 0) {
           debugPrintF(DRIVER,"error in copy_from_user case C_SPISLAVE_IOSETREADEP: at\n");
           goto TEST_IOCTL_FAIL;
         }
+        data.res=0;
         /* do the stuff and set data.res */
         if(data.readerPtr<4 || data.readerPtr>VMEMSIZE){
           debugPrintF(DRIVER,"Invalid readerPtr %d value\n",data.readerPtr); 
           data.res=EIOCTL_OUTSIDEB;
-        }else if(readerIndex<=*(writerIndex) && data.readerPtr >(*writerIndex)){
+        }else if(*readerIndex<=*(writerIndex) && data.readerPtr >(*writerIndex)){
           debugPrintF(DRIVER,"Invalid readerPtr %d cannot go ahead writer %d\n",
               data.readerPtr,*writerIndex); 
           data.res=EIOCTL_OUTSIDEB;
-        }else if(readerIndex>(*writerIndex) && 
-            ( (data.readerPtr<readerIndex && data.readerPtr >=(*writerIndex))  ) ){
-          debugPrintF(DRIVER,"Invalid readerPtr %d cannot go backward its actual value %d\n",
-              data.readerPtr,readerIndex); 
-          data.res=EIOCTL_RBACWARD;
         }else{
-          readerIndex=data.readerPtr;
-          debugPrintF(DRIVER,"New readerIndex value %d\n",readerIndex);
+          *readerIndex=data.readerPtr;
+          debugPrintF(DRIVER,"New readerIndex value %d\n",*readerIndex);
         }
         if ((err = copy_to_user((YSPISLAVE_SETREADERP *)arg, &data, sizeof(YSPISLAVE_SETREADERP))) < 0) {
           debugPrintF(DRIVER,"error in copy_to_user at\n");
@@ -328,8 +362,10 @@ int alloc_vmem(void){
       SetPageReserved(vmalloc_to_page((void *)(((unsigned long)vmalloc_area) + i)));
     }
   }
-  writerIndex=(unsigned int*)vmalloc_area;
-  *writerIndex=4;
+  writerIndex=(unsigned int*)&vmalloc_area[WRITE_IDX_START];
+  readerIndex=(unsigned int*)&vmalloc_area[READ_IDX_START];
+  *readerIndex=DATA_IDX_START;
+  *writerIndex=DATA_IDX_START;
   return ret;
 }
 void free_vmem(void){
@@ -343,6 +379,7 @@ void free_vmem(void){
     vfree(vmalloc_area);
     vmalloc_area=NULL;
     writerIndex=NULL;
+    readerIndex=NULL;
   }
 }
 // helper function, mmap's the vmalloc'd area which is not physically contiguous
@@ -471,14 +508,16 @@ void  char_exit(void){
 
 /* create a timer for debugging purpose*/
 /* timer function for debugging purpose*/
+unsigned long int lastFasync=0;
 void add_fake_data(unsigned long arg){
   unsigned char *n = (unsigned char*)arg;
   if(addToBuffer(*n)){
    printk(KERN_ERR"No space left\n");
   }else{
-    if (async_queue){
-      //debugPrintF(DRIVER,"call kill_fasync\n");
+    if (async_queue && ((jiffies - lastFasync)> 10*HZ)){
+      debugPrintF(DRIVER,"writerIndex=%d\n",*writerIndex);
       kill_fasync(&async_queue, SIGIO, POLL_IN);
+      lastFasync=jiffies;
     }
     if(run_timer){
       *n=*n+1;
@@ -486,7 +525,8 @@ void add_fake_data(unsigned long arg){
       fake_timer.data=(unsigned long)&fake_count;
       fake_timer.function=add_fake_data;
       /* 1 Second in the future */
-      fake_timer.expires=jiffies + HZ;
+      //fake_timer.expires=jiffies + HZ;
+      fake_timer.expires=jiffies + TIMERDELAY;
       add_timer(&fake_timer);
     }
   }
@@ -595,7 +635,38 @@ unsigned int* get_cspi_addr( char *regName, unsigned int *base)
   return addr;
 }		/* -----  end of function get_cspi_addr  ----- */
 
+spi_slave_device * getDevice(char *name){
+  int i=0;
+  int l= sizeof(spi_devices)/sizeof(spi_devices[0]);
+  if(name==NULL)
+  {
+    printkE(DRIVER,"Error null pointer passed as name\n");
+  }
+  for(i=0;i<l;i++){
+    if(strcasecmp(name,spi_devices[i].name)==0){
+      return &spi_devices[i];
+    }
+  }
+  return NULL;
+}
 
+unsigned int * getDeviceBase(char *name){
+  unsigned int *base=NULL;
+  spi_slave_device *dev = NULL;
+  if(name==NULL)
+  {
+    printkE(DRIVER,"Error null pointer passed as name\n");
+  }
+  dev = getDevice(name);
+    if(dev){
+#ifdef RAW
+      base= (unsigned int *)dev->regs_addr;
+#else
+      base= dev->base;
+#endif
+    }
+  return base;
+}
 
 /* 
  * ===  FUNCTION  ======================================================================
@@ -605,10 +676,15 @@ unsigned int* get_cspi_addr( char *regName, unsigned int *base)
  */
 int write_proc_ecspi1(struct file *file, const char __user *buffer, unsigned long count, void *data)
 {
-  unsigned int *base= spi_devices[0].base;
-  char *end=NULL;
+ char *end=NULL;
   unsigned int *addr=NULL;
   unsigned int val=simple_strtol(buffer,&end,0);
+  unsigned int *base=getDeviceBase("ECSPI-1");
+  if(base==NULL){
+    printkE(DRIVER,"Failed to get base address\n");
+    return -EINVAL;
+  }
+
   if(data==NULL){
     printkE("","data is null\n");
     return -EINVAL;
@@ -618,6 +694,20 @@ int write_proc_ecspi1(struct file *file, const char __user *buffer, unsigned lon
   }
   if((addr=get_ecspi_addr(data,base))!=NULL){
     debugPrintFL(50,DRIVER,"addr=%p,val=0x%x\n",addr,val);
+    if(strcmp(data,ecspi_regs_name[N_ECSPIX_CONFIGREG])==0){
+      spi_slave_device *dev=getDevice("ECSPI-1");
+      if(dev){
+        /*  Polarity of the CS signal not used  */
+        if(GET_BITS(val,12,12)){
+          //set
+          dev->mode |= SPI_CS_HIGH;
+        }else{
+          //clear
+          dev->mode &= ~SPI_CS_HIGH;
+        }
+      }
+    }
+
     writel(val,addr);
   }else{
     printkE(__FUNCTION__,"register not Found\n");
@@ -633,10 +723,15 @@ int write_proc_ecspi1(struct file *file, const char __user *buffer, unsigned lon
  */
 int write_proc_ecspi2(struct file *file, const char __user *buffer, unsigned long count, void *data)
 {
- unsigned int *base= spi_devices[1].base;
-  char *end=NULL;
+ char *end=NULL;
   unsigned int *addr=NULL;
   unsigned int val=simple_strtol(buffer,&end,0);
+  unsigned int *base=getDeviceBase("ECSPI-2");
+  if(base==NULL){
+    printkE(DRIVER,"Failed to get base address\n");
+    return -EINVAL;
+  }
+
   if(data==NULL){
     printkE("","data is null\n");
     return -EINVAL;
@@ -646,7 +741,46 @@ int write_proc_ecspi2(struct file *file, const char __user *buffer, unsigned lon
   }
   if((addr=get_ecspi_addr(data,base))){
     debugPrintFL(50,DRIVER,"addr=%p,val=0x%x\n",addr,val);
+    if(strcmp(data,ecspi_regs_name[N_ECSPIX_CONFIGREG])==0){
+      spi_slave_device *dev=getDevice("ECSPI-2");
+      if(dev){
+        /*  Polarity of the CS signal not used  */
+        if(GET_BITS(val,12,12)){
+          //set
+          dev->mode |= SPI_CS_HIGH;
+        }else{
+          //clear
+          dev->mode &= ~SPI_CS_HIGH;
+        }
+      }
+    }
+    if(strcmp(data,ecspi_regs_name[N_ECSPIX_CONREG])==0){
+      spi_slave_device *dev=getDevice("ECSPI-2");
+      if(dev){
+          //set master flag
+          dev->master=GET_BITS(val,4,4);
+      }
+    }
+    if(strcmp(data,ecspi_regs_name[N_ECSPIX_TXDATA])==0){
+      spi_slave_device *dev=getDevice("ECSPI-2");
+      if(dev){
+        set_chipSelect(dev);
+      }
+    }
     writel(val,addr);
+    if(strcmp(data,ecspi_regs_name[N_ECSPIX_TXDATA])==0){
+      spi_slave_device *dev=getDevice("ECSPI-2");
+      if(dev){
+        if(dev->master)
+        {
+          gpio_direction_output(dev->gpio_cs, dev->mode & SPI_CS_HIGH ? 0 : 1);
+          gpio_set_value(dev->gpio_cs,0);
+        }else{
+          gpio_direction_input(dev->gpio_cs);
+          debugPrintFL(50,DRIVER,"direction slave:INPUT" );
+        }
+      }
+    }
   }else{
     printkE(__FUNCTION__,"register not Found\n");
   }
@@ -661,10 +795,16 @@ int write_proc_ecspi2(struct file *file, const char __user *buffer, unsigned lon
  */
 int write_proc_cspi(struct file *file, const char __user *buffer, unsigned long count, void *data)
 {
-  unsigned int *base= spi_devices[2].base;
   char *end=NULL;
   unsigned int *addr=NULL;
   unsigned int val=simple_strtol(buffer,&end,0);
+  unsigned int *base=getDeviceBase("CSPI");
+  if(base==NULL){
+    printkE(DRIVER,"Failed to get base address\n");
+    return -EINVAL;
+  }
+
+
   if(data==NULL){
     printkE("","data is null\n");
     return -EINVAL;
@@ -694,11 +834,13 @@ int write_spi_reg(uint8_t n,uint32_t val,spi_slave_device *dev)
     debugPrintFL(50,DRIVER,"invalid reg number %d passed\n",n);
     return -EINVAL;
   }
+#ifndef RAW
   if(dev->base==NULL){
     debugPrintFL(50,DRIVER,"invalid base address passed\n");
     return -EINVAL;
   }
-  if((addr=((dev->type==ECSPI)?get_ecspi_addr(ecspi_regs_name[n],dev->base):get_cspi_addr(cspi_regs_name[n],dev->base)))){
+#endif
+  if((addr=(get_ecspi_addr(ecspi_regs_name[n],getDeviceBase(dev->name))))){
     writel(val,addr);
     debugPrintFL(50,DRIVER,"addr=%p,val=0x%x\n",addr,val);
     return 0;
@@ -722,11 +864,13 @@ int32_t read_spi_reg(uint8_t n,spi_slave_device *dev)
     debugPrintFL(50,DRIVER,"invalid reg number %d passed\n",n);
     return -EINVAL;
   }
+#ifndef RAW
   if(dev->base==NULL){
     debugPrintFL(50,DRIVER,"invalid base address passed\n");
     return -EINVAL;
   }
-  if((addr=((dev->type==ECSPI)?get_ecspi_addr(ecspi_regs_name[n],dev->base):get_cspi_addr(cspi_regs_name[n],dev->base)))){
+#endif
+  if((addr=(get_ecspi_addr(ecspi_regs_name[n],getDeviceBase(dev->name))))){
     val=readl(addr);
     debugPrintFL(50,DRIVER,"addr=%p,val=0x%x\n",addr,val);
     return val;
@@ -749,7 +893,6 @@ int read_proc_cspi(char *page, char **start, off_t offset,int count, int *eof, v
 
   char *regName = data;
   int read=0;
-  unsigned int *base= spi_devices[2].base;
   unsigned int *addr=NULL;
   unsigned int val=0;
   if(data==NULL){
@@ -759,8 +902,7 @@ int read_proc_cspi(char *page, char **start, off_t offset,int count, int *eof, v
   if(count>PAGE_SIZE){
     count=PAGE_SIZE;
   }
-
- if((addr=get_cspi_addr(regName,base))){
+  if((addr=(get_cspi_addr(regName,getDeviceBase("CSPI"))))){
     val=readl(addr);
     debugPrintFL(50,DRIVER,"addr=%p,val=0x%x\n",addr,val);
     read+=sprintf(page+read,"0x%08x\n",val);
@@ -773,6 +915,57 @@ int read_proc_cspi(char *page, char **start, off_t offset,int count, int *eof, v
 
 
 
+int parse_ecspi_reg(char *regName, unsigned int val,char * page){
+  int read=0;
+  if(regName==NULL || page==NULL){
+    printkE(DRIVER,"null arguments\n");
+    return read;
+  }
+  if(strcmp(regName,ecspi_regs_name[N_ECSPIX_CONREG])==0){
+    read+=sprintf(page+read,"burstl=0x%x ",GET_BITS(val,20,31));
+    read+=sprintf(page+read,"chnnelSelect=0x%x ",GET_BITS(val,18,19));
+    read+=sprintf(page+read,"spiDataRdyCtl=0x%x ",GET_BITS(val,16,17));
+    read+=sprintf(page+read,"preDivider=0x%x ",GET_BITS(val,12,15));
+    read+=sprintf(page+read,"postDivider=0x%x \n",GET_BITS(val,8,11));
+    read+=sprintf(page+read,"channelMode 0x%x ",GET_BITS(val,4,7));
+    read+=sprintf(page+read,"startModeControl 0x%x ",GET_BITS(val,3,3));
+    read+=sprintf(page+read,"initExchange 0x%x ",GET_BITS(val,2,2));
+    read+=sprintf(page+read,"HwTriggerEnabled 0x%x ",GET_BITS(val,1,1));
+    read+=sprintf(page+read,"spiPortEnabled 0x%x \n",GET_BITS(val,0,0));
+  }else if(strcmp(regName,ecspi_regs_name[N_ECSPIX_CONFIGREG])==0){
+    read+=sprintf(page+read,"lenghtInHTmode=0x%x ",GET_BITS(val,24,28));
+    read+=sprintf(page+read,"inactiveClkState=0x%x ",GET_BITS(val,20,23));
+    read+=sprintf(page+read,"inactiveDataState=0x%x ",GET_BITS(val,16,19));
+    read+=sprintf(page+read,"chipSelectPolarity=0x%x\n",GET_BITS(val,12,15));
+    read+=sprintf(page+read,"chipSelMarkBurst=0x%x ",GET_BITS(val,8,11));
+    read+=sprintf(page+read,"clkPolarity 0x%x ",GET_BITS(val,4,7));
+    read+=sprintf(page+read,"clkPhase 0x%x ",GET_BITS(val,0,3));
+  }else if(strcmp(regName,ecspi_regs_name[N_ECSPIX_INTREG])==0){
+    read+=sprintf(page+read,"transferCompleteIrqEn=0x%x ",GET_BITS(val,7,7));
+    read+=sprintf(page+read,"RXFifoOverflowIrqEn=0x%x ",GET_BITS(val,6,6));
+    read+=sprintf(page+read,"RxFifoFullIrqEn=0x%x ",GET_BITS(val,5,5));
+    read+=sprintf(page+read,"RxDataRequestIrqEn=0x%x\n",GET_BITS(val,4,4));
+    read+=sprintf(page+read,"RxReadyIrqEn=0x%x ",GET_BITS(val,3,3));
+    read+=sprintf(page+read,"TxFullIrqEna 0x%x ",GET_BITS(val,2,2));
+    read+=sprintf(page+read,"TxFifoDataReqIrqEna 0x%x ",GET_BITS(val,1,1));
+    read+=sprintf(page+read,"TxFifoEmptyIrqEna 0x%x ",GET_BITS(val,0,0));
+  }else if(strcmp(regName,ecspi_regs_name[N_ECSPIX_DMAREG])==0){
+  }else if(strcmp(regName,ecspi_regs_name[N_ECSPIX_STATUS])==0){
+    read+=sprintf(page+read,"transferComplete=0x%x ",GET_BITS(val,7,7));
+    read+=sprintf(page+read,"RXFifoOverflow=0x%x ",GET_BITS(val,6,6));
+    read+=sprintf(page+read,"RxFifoFull=0x%x ",GET_BITS(val,5,5));
+    read+=sprintf(page+read,"RxDataRequest=0x%x\n",GET_BITS(val,4,4));
+    read+=sprintf(page+read,"RxReady=0x%x ",GET_BITS(val,3,3));
+    read+=sprintf(page+read,"TxFull 0x%x ",GET_BITS(val,2,2));
+    read+=sprintf(page+read,"TxFifoDataReq 0x%x ",GET_BITS(val,1,1));
+    read+=sprintf(page+read,"TxFifoEmpty 0x%x ",GET_BITS(val,0,0));
+   }else if(strcmp(regName,ecspi_regs_name[N_ECSPIX_PERIODREG])==0){
+  }else if(strcmp(regName,ecspi_regs_name[N_ECSPIX_TESTREG])==0){
+  }else if(strcmp(regName,ecspi_regs_name[N_ECSPIX_MSGDATA])==0){
+  } 
+  return read;
+
+}
 
 /* 
  * ===  FUNCTION  ======================================================================
@@ -798,6 +991,7 @@ int read_proc_ecspi(char *page, char **start, off_t offset,int count, int *eof, 
     val=readl(addr);
     debugPrintFL(50,DRIVER,"addr=%p,val=0x%x\n",addr,val);
     read+=sprintf(page+read,"0x%08x\n",val);
+    read+=parse_ecspi_reg(regName,val,page+read);
   }else{
     printkE(__FUNCTION__,"register not Found\n");
   }
@@ -813,7 +1007,7 @@ int read_proc_ecspi1(char *page, char **start, off_t offset,int count, int *eof,
     count=PAGE_SIZE;
   }
  debugPrintFL(50,DRIVER,"%s: to Read %s\n",__FUNCTION__,(char *)data);
- return read_proc_ecspi(page,start,offset,count,eof,data,spi_devices[0].base);
+ return read_proc_ecspi(page,start,offset,count,eof,data,getDeviceBase("ECSPI-1"));
 }		/* -----  end of function read_proc  ----- */
 
 int read_proc_ecspi2(char *page, char **start, off_t offset,int count, int *eof, void *data)
@@ -824,7 +1018,7 @@ int read_proc_ecspi2(char *page, char **start, off_t offset,int count, int *eof,
     count=PAGE_SIZE;
   }
  debugPrintFL(50,DRIVER,"%s: to Read %s\n",__FUNCTION__,(char *)data);
- return read_proc_ecspi(page,start,offset,count,eof,data,spi_devices[1].base);
+ return read_proc_ecspi(page,start,offset,count,eof,data,getDeviceBase("ECSPI-2"));
 }		/* -----  end of function read_proc  ----- */
 
 
@@ -969,7 +1163,6 @@ static unsigned int mx51_ecspi_clkdiv(unsigned int fin, unsigned int fspi)
         return (pre << MX51_ECSPI_CTRL_PREDIV_OFFSET) |
                 (post << MX51_ECSPI_CTRL_POSTDIV_OFFSET);
 }
-
 static int  mx51_ecspi_config(spi_slave_device *dev)
 {
         u32 ctrl = MX51_ECSPI_CTRL_ENABLE, cfg = 0;
@@ -995,7 +1188,7 @@ static int  mx51_ecspi_config(spi_slave_device *dev)
         //configure the burst length in this context the single burst is
         //consideret as a "word" and with this setting the number of byte
         //are considered
-        ctrl |= (dev->bits_per_word/8 -1) << MX51_ECSPI_CTRL_BL_OFFSET;
+        ctrl |= (dev->bits_per_word -1) << MX51_ECSPI_CTRL_BL_OFFSET;
 
         //control when the spi burst is detected and RXBUFFER advanced
         if(dev->detect_onCS){
@@ -1009,15 +1202,15 @@ static int  mx51_ecspi_config(spi_slave_device *dev)
 
         if (dev->mode & SPI_CPHA){
                 cfg |= MX51_ECSPI_CONFIG_SCLKPHA(0);
-                cfg |= MX51_ECSPI_CONFIG_SCLKPHA(1);
-                cfg |= MX51_ECSPI_CONFIG_SCLKPHA(2);
-                cfg |= MX51_ECSPI_CONFIG_SCLKPHA(3);
+                //cfg |= MX51_ECSPI_CONFIG_SCLKPHA(1);
+                //cfg |= MX51_ECSPI_CONFIG_SCLKPHA(2);
+                //cfg |= MX51_ECSPI_CONFIG_SCLKPHA(3);
         }
         if (dev->mode & SPI_CPOL){
                 cfg |= MX51_ECSPI_CONFIG_SCLKPOL(0);
-                cfg |= MX51_ECSPI_CONFIG_SCLKPOL(1);
-                cfg |= MX51_ECSPI_CONFIG_SCLKPOL(2);
-                cfg |= MX51_ECSPI_CONFIG_SCLKPOL(3);
+                //cfg |= MX51_ECSPI_CONFIG_SCLKPOL(1);
+                //cfg |= MX51_ECSPI_CONFIG_SCLKPOL(2);
+                //cfg |= MX51_ECSPI_CONFIG_SCLKPOL(3);
         }
         /*  Polarity of the CS signal not used  */
         if (dev->mode & SPI_CS_HIGH)
@@ -1026,9 +1219,9 @@ static int  mx51_ecspi_config(spi_slave_device *dev)
         /* configure if the data line stay high=0 or low=1 when in idle */
         if (0){
                 cfg |= MX51_ECSPI_CONFIG_DATA_IDLE(0);
-                cfg |= MX51_ECSPI_CONFIG_DATA_IDLE(1);
-                cfg |= MX51_ECSPI_CONFIG_DATA_IDLE(2);
-                cfg |= MX51_ECSPI_CONFIG_DATA_IDLE(3);
+                //cfg |= MX51_ECSPI_CONFIG_DATA_IDLE(1);
+                //cfg |= MX51_ECSPI_CONFIG_DATA_IDLE(2);
+                //cfg |= MX51_ECSPI_CONFIG_DATA_IDLE(3);
         }
         write_spi_reg(N_ECSPIX_CONREG,ctrl,dev);
         write_spi_reg(N_ECSPIX_CONFIGREG,cfg,dev);
@@ -1068,15 +1261,12 @@ static int __init init_dd ( void )
     printkE(DRIVER,"Failed to initialize IOMUX for ecspi1\n");
     goto fail;
   }
-  ret = mxc_iomux_v3_setup_multiple_pads(spi1_pads,
-      ARRAY_SIZE(spi1_pads));
-  if (ret){
-    printkE(DRIVER,"Failed to initialize IOMUX for ecspi2\n");
-    goto fail;
-  }
- /* request resources */
+/* request resources */
   for(i=0;i<nSpi;i++){
     ret=0;
+    gpio_request(spi_devices[i].gpio_cs, DRIVER);
+
+#ifndef RAW
     if (!request_mem_region(spi_devices[i].regs_addr, XCSPI_SIZE, spi_devices[i].name)) {
       printk(KERN_WARNING "request_mem_region 0x%x for %s failed\n",spi_devices[i].regs_addr,spi_devices[i].name);
       ret = -EBUSY;
@@ -1096,7 +1286,7 @@ static int __init init_dd ( void )
         spi_devices[i].regs_addr,
         spi_devices[i].base);
     spi_devices[i].initStatus|=IOREMAPPED;
-
+#endif
     ret = request_irq(spi_devices[i].irq, spi_slave_isr, 0, DRIVER, &spi_devices[i]);
     if (ret) {
       printk(KERN_WARNING "can't get irq%d: %d\n", spi_devices[i].irq, ret);
@@ -1142,6 +1332,7 @@ retryClock:
       spi_devices[i].spi_clk = clk_get_rate(spi_devices[i].clk);
       debugPrintFL(50,DRIVER,"default clock rate for %s is %ld\n",spi_devices[i].name, spi_devices[i].spi_clk);
     }
+    set_chipSelect(&spi_devices[i]);
   }
 
   /* register chardev */
@@ -1203,6 +1394,7 @@ void deinit_device (spi_slave_device *dev)
     debugPrintFL(50 ,DRIVER,"%s released mem region\n",dev->name);
     dev->initStatus&=(~MEM_REQUESTED);
   }
+  gpio_free(dev->gpio_cs);
   debugPrintFL(50 ,DRIVER,"%s initStatus = 0x%x\n",dev->name,dev->initStatus);
 }		/* -----  end of function deinit_device  ----- */
 char *ecspi_regs_name[]={
@@ -1282,6 +1474,11 @@ static void __exit exit_dd ( void )
   if(spi_parent){
     unregister_proc(PROC_NAME,NULL);
   }
+  debugPrintF(DRIVER,"stop reading from spi\n");
+  run_timer=false;
+  del_timer_sync(&fake_timer);
+  fake_count=0;
+
   char_exit();
   free_vmem();
   debugPrintFL(50 ,DRIVER,"Exiting\n");
@@ -1364,11 +1561,11 @@ BOOL uart_write_ring(RING_BUF_T* p, BYTE data)
 int addToBuffer(char newValue)
 {
   unsigned int w= (*writerIndex)+1;
-  debugPrintFL(50 ,DRIVER,"index at %d value 0x%x\n",*writerIndex,newValue);
+  //debugPrintFL(50 ,DRIVER,"index at %d value 0x%x\n",*writerIndex,newValue);
   if(w>=VMEMSIZE){
-    w=4;
+    w=WRITE_IDX_START;
   }
-  if(w != readerIndex){
+  if(w != *readerIndex){
     vmalloc_area[*writerIndex]=newValue;
     *writerIndex=w;
     return 0;
@@ -1382,17 +1579,16 @@ int readBuffer(char* pData)
     debugPrintFL(50,DRIVER,"Invalid pointer pData\n");
     return -EINVAL;
   }
-  if (readerIndex == *writerIndex ){
+  if (*readerIndex == *writerIndex ){
     debugPrintFL(50,DRIVER,"no data available\n");
     return -ENOSPC;
   }
 
-  *pData = vmalloc_area[readerIndex];       /* Get data */
-
-  readerIndex++;
-  if (readerIndex >=VMEMSIZE )
+  *pData = vmalloc_area[*readerIndex];       /* Get data */
+  *readerIndex=(*readerIndex)+1;
+  if (*readerIndex >=VMEMSIZE )
   {
-    readerIndex=4;
+    *readerIndex=DATA_IDX_START;
   }
   return 0;
 }

@@ -139,6 +139,7 @@ typedef struct _spi_slave_device{
   /* proc parent for registers interface */
   struct proc_dir_entry *proc_dir;
 #endif
+  uint8_t gpio_cs;
 }spi_slave_device;
 extern spi_slave_device spi_devices[];
 extern char *ecspi_regs_name[];

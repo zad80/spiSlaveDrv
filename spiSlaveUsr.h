@@ -2,8 +2,11 @@
 #define __SPISLAVE_USR__
 #include <linux/ioctl.h>
 // length of the two memory areas
-#define VMEMSIZE (1024*1024*510)
-
+//#define VMEMSIZE (1024*1024*510)
+#define VMEMSIZE (4096)
+#define WRITE_IDX_START 0
+#define READ_IDX_START 5
+#define DATA_IDX_START 9
 // ioctl part 
 #define SPISLAVE_MAGIC 'z'
 
